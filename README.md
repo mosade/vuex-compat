@@ -143,7 +143,8 @@ app.use(pinia).use(store)
 | --- | --- | --- |
 | ⚠️ | mutation 和 action **同名**（比如都叫 `login`） | Pinia 里只能有一个同名 action，所以 commit 和 dispatch 调到的是同一个函数。处理方式：在模块配置的 `mutations` / `actions` 映射表里把它们分别指向不同的 action |
 | ⚠️ | commit 调到了异步 action | 不会等待 action 完成，`subscribe` 回调会在异步逻辑完成之前触发。mutation 应保证是同步的 |
-| ⚠️ | 找不到对应的 type | 和 Vuex 一样会 `console.error`，不会抛异常；区别是生产环境也会打印 |
+| ⚠️ | 找不到对应的 type | 和 Vuex 一样会 `console.error`，不会抛异常；区别是生产环境也会打印（其他 `warn` 级别的提示在生产环境会关闭） |
+| ⚠️ | 非 async 的 action 同步抛出异常 | 和 Vuex 4 一致：`dispatch` 会直接同步抛出，而不是返回 rejected promise，因此 `.catch()` 接不到，`subscribeAction` 的 `error` 钩子也不会被调用（`before` 已经执行过）。如果调用方依赖 `.catch()`，请把 action 写成 `async` |
 
 ### 三、state
 

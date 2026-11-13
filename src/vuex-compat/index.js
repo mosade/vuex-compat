@@ -15,12 +15,20 @@
  *   - commit / dispatch('a/b/x', payload) → useAbStore().x(payload)
  *     （Pinia 没有 mutation，mutation 改写为 action；也可用 mutations / actions 映射表重定向）
  */
-import { inject, watch as vueWatch } from 'vue'
+import { inject, shallowRef, watch as vueWatch } from 'vue'
 
 export const storeKey = 'store'
 
 let activeStore = null
-const isDev = typeof process !== 'undefined' ? process.env.NODE_ENV !== 'production' : true
+// 必须直接引用 process.env.NODE_ENV，打包工具才会在构建时把它替换成字面量；
+// 没有替换、运行时又不存在 process 的环境（比如直接在浏览器里用 ESM）会进入 catch，按开发环境处理
+const isDev = (() => {
+  try {
+    return process.env.NODE_ENV !== 'production'
+  } catch {
+    return true
+  }
+})()
 const PREFIX = '[vuex-compat]'
 
 function warn(msg) {
@@ -30,6 +38,8 @@ function warn(msg) {
 function isObject(v) {
   return v !== null && typeof v === 'object'
 }
+
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key)
 
 function normalizePath(path) {
   return Array.isArray(path) ? path.join('/') : String(path).replace(/^\/+|\/+$/g, '')
@@ -90,12 +100,17 @@ export class CompatStore {
     this._subscribers = []
     this._actionSubscribers = []
     this._nodeCache = new Map()
-    this._localGettersCache = new Map()
+    this._contextCache = new Map()
+    // 模块注册表本身不是响应式的；用这个版本号让依赖注册表的 computed / watch 在注册、注销模块后重新计算
+    this._version = shallowRef(0)
+    this._prefixes = new Set() // 所有模块路径及其祖先路径
+    this._children = new Map() // 路径 → 直接子段名列表（根路径为 ''）
 
     Object.keys(modules).forEach((p) => {
       const path = normalizePath(p)
       this._modules.set(path, normalizeModule(path, modules[p]))
     })
+    this._rebuildIndex()
 
     // 与 Vuex 一致：commit / dispatch 绑定 this，支持解构使用
     const store = this
@@ -126,25 +141,48 @@ export class CompatStore {
     return mod.useStore(this._pinia)
   }
 
+  /** 注册表变化后重建索引、清空缓存，并通知依赖方 */
+  _rebuildIndex() {
+    const prefixes = new Set()
+    const children = new Map()
+    const addChild = (parent, seg) => {
+      let set = children.get(parent)
+      if (!set) children.set(parent, (set = new Set()))
+      set.add(seg)
+    }
+    for (const path of this._modules.keys()) {
+      const segs = path.split('/')
+      for (let i = 0; i < segs.length; i++) {
+        prefixes.add(segs.slice(0, i + 1).join('/'))
+        addChild(segs.slice(0, i).join('/'), segs[i])
+      }
+    }
+    this._prefixes = prefixes
+    this._children = new Map([...children].map(([k, v]) => [k, [...v]]))
+    this._nodeCache.clear()
+    this._contextCache.clear()
+    this._version.value++
+  }
+
+  /** 读取版本号以建立响应式依赖 */
+  _track() {
+    // eslint-disable-next-line no-unused-expressions
+    this._version.value
+  }
+
   _hasModuleOrDescendant(path) {
-    if (this._modules.has(path)) return true
-    const prefix = `${path}/`
-    for (const key of this._modules.keys()) if (key.startsWith(prefix)) return true
-    return false
+    this._track()
+    return this._prefixes.has(path)
   }
 
   _childSegments(path) {
-    const prefix = path ? `${path}/` : ''
-    const set = new Set()
-    for (const key of this._modules.keys()) {
-      if (prefix && !key.startsWith(prefix)) continue
-      set.add(key.slice(prefix.length).split('/')[0])
-    }
-    return [...set]
+    this._track()
+    return this._children.get(path) || []
   }
 
   /** 某路径自身的 state（Pinia $state），根路径为 root store 的 state */
   _ownState(path) {
+    this._track()
     const mod = path ? this._modules.get(path) : this._root
     return mod ? this._instance(mod).$state : undefined
   }
@@ -209,6 +247,7 @@ export class CompatStore {
 
   /** 解析 'a/b/name' → [{ store, mod, name }]；无命名空间时在 root 和非命名空间模块中查找 */
   _resolveTargets(type) {
+    this._track()
     const [ns, name] = splitType(type)
     if (ns) {
       const mod = this._modules.get(ns)
@@ -224,13 +263,14 @@ export class CompatStore {
   _resolveHandlers(type, kind) {
     const handlers = []
     for (const { mod, name } of this._resolveTargets(type)) {
-      const mapping = mod[kind][name]
+      // 只认自身属性，避免 'constructor'、'toString' 等 Object.prototype 成员被当成映射或 action
+      const mapping = hasOwn(mod[kind], name) ? mod[kind][name] : undefined
       const instance = this._instance(mod)
       if (typeof mapping === 'function') {
         handlers.push((payload) => mapping(instance, payload, this))
       } else {
         const actionName = typeof mapping === 'string' ? mapping : name
-        if (typeof instance[actionName] === 'function') {
+        if (hasOwn(instance, actionName) && typeof instance[actionName] === 'function') {
           handlers.push((payload) => instance[actionName](payload))
         }
       }
@@ -243,7 +283,7 @@ export class CompatStore {
     // （getters['user/byId'](1) 这种返回函数的 getter 也能正常工作）
     for (const { mod, name } of this._resolveTargets(type)) {
       const instance = this._instance(mod)
-      if (!name.startsWith('$') && !name.startsWith('_') && name in instance) {
+      if (!name.startsWith('$') && !name.startsWith('_') && hasOwn(instance, name)) {
         return { found: true, value: instance[name] }
       }
     }
@@ -254,7 +294,8 @@ export class CompatStore {
     const store = this
     return new Proxy(Object.create(null), {
       get(_, key) {
-        if (typeof key !== 'string') return undefined
+        // Vue 内部标记（__v_isRef、__v_isShallow 等）与 state 节点的处理保持一致
+        if (typeof key !== 'string' || key.startsWith('__v_')) return undefined
         const { found, value } = store._getGetter(key)
         if (!found && isDev && !IGNORED_KEYS.has(key)) warn(`unknown getter: ${key}`)
         return value
@@ -270,35 +311,41 @@ export class CompatStore {
   }
 
   /** 模块局部上下文（供 mapXxx 带命名空间时使用） */
+  /** 检查命名空间是否已注册（会建立响应式依赖，模块注册后 mapXxx 能自动恢复） */
+  _assertModule(ns, helper) {
+    this._track()
+    if (this._modules.has(ns)) return true
+    warn(`module namespace not found in ${helper}(): ${ns}/`)
+    return false
+  }
+
+  /** 模块局部上下文（供 mapXxx 带命名空间时使用），按命名空间缓存，注册表变化时失效 */
   _getModuleContext(ns, helper) {
-    if (!this._modules.has(ns)) {
-      warn(`module namespace not found in ${helper}(): ${ns}/`)
-      return null
-    }
-    let getters = this._localGettersCache.get(ns)
-    if (!getters) {
-      const store = this
-      getters = new Proxy(Object.create(null), {
+    if (!this._assertModule(ns, helper)) return null
+    let ctx = this._contextCache.get(ns)
+    if (ctx) return ctx
+    const store = this
+    const toFull = (args) => (args.options && args.options.root ? args.type : `${ns}/${args.type}`)
+    ctx = {
+      get state() {
+        return store._stateAt(ns)
+      },
+      getters: new Proxy(Object.create(null), {
         get: (_, key) => (typeof key === 'string' ? store.getters[`${ns}/${key}`] : undefined),
         has: (_, key) => typeof key === 'string' && store._getGetter(`${ns}/${key}`).found,
-      })
-      this._localGettersCache.set(ns, getters)
-    }
-    return {
-      state: this._stateAt(ns),
-      getters,
+      }),
       // 与 Vuex 一致：options.root 为 true 时按全局 type 处理（对象风格时 options 在第二个参数）
       commit: (type, payload, options) => {
         const args = unifyObjectStyle(type, payload, options)
-        const full = args.options && args.options.root ? args.type : `${ns}/${args.type}`
-        return this.commit(full, args.payload)
+        return store.commit(toFull(args), args.payload)
       },
       dispatch: (type, payload, options) => {
         const args = unifyObjectStyle(type, payload, options)
-        const full = args.options && args.options.root ? args.type : `${ns}/${args.type}`
-        return this.dispatch(full, args.payload)
+        return store.dispatch(toFull(args), args.payload)
       },
     }
+    this._contextCache.set(ns, ctx)
+    return ctx
   }
 
   // ---------- Vuex 公共 API ----------
@@ -379,7 +426,10 @@ export class CompatStore {
 
   replaceState(newState) {
     const apply = (path, value) => {
-      if (!isObject(value)) return
+      if (!isObject(value)) {
+        warn(`replaceState(): state of "${path || '<root>'}" must be an object, got ${value === null ? 'null' : typeof value}; skipped.`)
+        return
+      }
       const own = {}
       Object.keys(value).forEach((key) => {
         const child = path ? `${path}/${key}` : key
@@ -396,18 +446,24 @@ export class CompatStore {
     const p = normalizePath(path)
     if (!p) throw new Error(`${PREFIX} cannot register the root module by using registerModule.`)
     this._modules.set(p, normalizeModule(p, def))
-    this._nodeCache.clear()
-    this._localGettersCache.clear()
+    this._rebuildIndex()
   }
 
+  /** 与 Vuex 一致：连同所有子模块一起注销 */
   unregisterModule(path) {
     const p = normalizePath(path)
-    if (!this._modules.delete(p)) warn(`trying to unregister module '${p}', which is not registered`)
-    this._nodeCache.clear()
-    this._localGettersCache.clear()
+    const prefix = `${p}/`
+    const targets = [...this._modules.keys()].filter((k) => k === p || k.startsWith(prefix))
+    if (!targets.length) {
+      warn(`trying to unregister module '${p}', which is not registered`)
+      return
+    }
+    targets.forEach((k) => this._modules.delete(k))
+    this._rebuildIndex()
   }
 
   hasModule(path) {
+    this._track()
     return this._modules.has(normalizePath(path))
   }
 
@@ -423,8 +479,8 @@ export class CompatStore {
   }
 }
 
-// Vue / devtools / 打印时会探测这些 key，不应报 unknown getter
-const IGNORED_KEYS = new Set(['__v_isRef', '__v_isReactive', '__v_raw', '__v_skip', '__v_isReadonly', 'toJSON', 'then', 'constructor'])
+// 序列化、Promise 判断、打印时会探测这些 key，不应报 unknown getter（__v_* 已在 get 中统一处理）
+const IGNORED_KEYS = new Set(['toJSON', 'then', 'constructor'])
 
 function genericSubscribe(fn, subs, options) {
   if (subs.indexOf(fn) < 0) {
@@ -495,7 +551,7 @@ export const mapGetters = normalizeNamespace((namespace, getters) => {
     const type = namespace ? `${namespace}/${val}` : val
     res[key] = function mappedGetter() {
       const store = currentStore(this)
-      if (namespace && !store._getModuleContext(namespace, 'mapGetters')) return
+      if (namespace && !store._assertModule(namespace, 'mapGetters')) return
       return store.getters[type]
     }
     res[key].vuex = true
